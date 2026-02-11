@@ -284,4 +284,3 @@ def _validate(actions: List[Dict], total_res: int, level: int, alive_ids: Set[in
                 spent += troops; targets.add(tid)
                 clean.append({"type": "attack", "targetId": tid, "troopCount": troops})
     return clean
-а 
