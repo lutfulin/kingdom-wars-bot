@@ -1,334 +1,283 @@
 """
-Kingdom Wars AI Strategy: "Adaptive Predator"
+Kingdom Wars AI Strategy: "Adaptive Predator v3.0" (Final Apex)
 
-Core principles:
-1. ECONOMY FIRST: Rush upgrades early (compound resource advantage)
-2. DOUBLE ALLIANCE: Propose alliance to 2 players, point them at the 3rd
-3. FOCUS FIRE: If we can kill someone this turn, always do it
-4. ADAPTIVE DEFENSE: Armor based on incoming threat + current HP
-5. FATIGUE AGGRESSION: All-in attack after turn 25
+Core Principles:
+1. AGGRESSIVE GROWTH: Force upgrades Level 1->4 (compound interest).
+2. TACTICAL DIPLOMACY: Double alliances, bluffing, and leader-rallying.
+3. ADAPTIVE THREAT: Predicted damage based on top 2 active threats.
+4. ROI ECONOMY: Only upgrade in mid-game if it pays back before fatigue/death.
+5. FOCUS FIRE: Kill shot priority > Coordinated targets > Revenge.
 """
 
 import math
 from collections import defaultdict
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 
 FATIGUE_TURN = 25
 MAX_LEVEL = 5
 
 
 def res_per_turn(level: int) -> int:
-    return math.ceil(20 * (1.5 ** (level - 1)))
+    """Accurate game resources per level."""
+    return int(round(20 * (1.5 ** (level - 1))))
 
 
 def upg_cost(current_level: int) -> int:
+    """Accurate upgrade costs per level."""
     return math.ceil(50 * (1.75 ** (current_level - 1)))
 
 
-# ─── Cross-Turn Memory ───────────────────────────────────────────────
+def fatigue_damage(turn: int) -> int:
+    """Fatigue starts at 5 and grows by 5 each turn."""
+    if turn <= FATIGUE_TURN: return 0
+    return 5 * (turn - FATIGUE_TURN)
+
+
+# ─── Intelligence System ─────────────────────────────────────────────
 
 class GameMemory:
-    """Tracks aggression, alliances, and betrayals across turns per game."""
+    """Elite cross-turn memory with activity tracking."""
 
     def __init__(self):
-        self._g: Dict[int, Dict] = {}
+        self._g: Dict[int, Dict[str, Any]] = {}
 
-    def _get(self, gid: int) -> Dict:
+    def _get(self, gid: int) -> Dict[str, Any]:
         if gid not in self._g:
             self._g[gid] = {
-                "agg": defaultdict(int),        # total troops sent at us
-                "ally_turns": defaultdict(set),  # turns they allied with us
-                "betrayals": defaultdict(int),   # attacked while allied
-                "our_allies": set(),
+                "agg": defaultdict(int),          # total troops sent at us
+                "ally_turns": defaultdict(set),   # turns they allied with us
+                "betrayals": defaultdict(int),    # attacked while allied
+                "our_allies": set(),              # who we proposed peace to
+                "active_turns": defaultdict(int), # last turn they attacked
             }
         return self._g[gid]
 
-    def record_attacks_on_us(self, gid, turn, my_id, attacks):
+    def record_intel(self, gid: int, turn: int, my_id: int, prev_attacks: List[Dict]):
         g = self._get(gid)
-        for a in attacks:
-            act = a.get("action", {})
-            if act.get("targetId") == my_id:
-                pid = a.get("playerId")
-                g["agg"][pid] += act.get("troopCount", 0)
-                if turn - 1 in g["ally_turns"].get(pid, set()):
-                    g["betrayals"][pid] += 1
+        for pa in prev_attacks:
+            act = pa.get("action", {}) or {}
+            pid = int(pa["playerId"])
+            target = act.get("targetId")
+            troops = int(act.get("troopCount", 0) or 0)
 
-    def record_diplomacy_to_us(self, gid, turn, diplomacy, my_id):
+            if troops > 0:
+                g["active_turns"][pid] = turn
+                if target == my_id:
+                    g["agg"][pid] += troops
+                    if (turn - 1) in g["ally_turns"].get(pid, set()):
+                        g["betrayals"][pid] += 1
+                        print(f"[INTEL] BETRAYAL detected! Player {pid} attacked us.")
+
+    def record_diplomacy(self, gid: int, turn: int, diplomacy: List[Dict], my_id: int):
         g = self._get(gid)
         for d in diplomacy:
-            if d.get("action", {}).get("allyId") == my_id:
+            act = d.get("action", {}) or {}
+            if act.get("allyId") == my_id:
                 g["ally_turns"][d["playerId"]].add(turn)
 
-    def agg(self, gid, pid):
-        return self._get(gid)["agg"].get(pid, 0)
+    def is_active(self, gid, pid, turn) -> bool:
+        last = self._get(gid)["active_turns"].get(pid, 0)
+        return (turn - last) <= 3
 
-    def betrayals(self, gid, pid):
-        return self._get(gid)["betrayals"].get(pid, 0)
+    def get_trust(self, gid, pid) -> float:
+        g = self._get(gid)
+        if g["betrayals"].get(pid, 0) > 0: return 0.0
+        if pid in g["ally_turns"]: return 0.8
+        return 0.5
 
-    def set_our_allies(self, gid, ids):
-        self._get(gid)["our_allies"] = set(ids)
-
-    def get_our_allies(self, gid):
-        return self._get(gid)["our_allies"]
-
+    def set_our_allies(self, gid, ids): self._get(gid)["our_allies"] = set(ids)
+    def get_our_allies(self, gid): return self._get(gid)["our_allies"]
     def cleanup(self):
         if len(self._g) > 500:
-            for k in list(self._g.keys())[:-100]:
-                del self._g[k]
-
+            for k in list(self._g.keys())[:-100]: del self._g[k]
 
 memory = GameMemory()
 
 
-# ─── Helper ──────────────────────────────────────────────────────────
-
-def _strength(e: Dict) -> float:
-    return res_per_turn(e["level"]) + e["hp"] * 0.5 + e["armor"]
-
-
-def _alive(enemies: List[Dict]) -> List[Dict]:
-    return [e for e in enemies if e["hp"] > 0]
-
-
-# ─── Negotiate ───────────────────────────────────────────────────────
+# ─── Strategy Engine ─────────────────────────────────────────────────
 
 def negotiate(gid: int, turn: int, player: Dict, enemies: List[Dict],
               combat_actions: List[Dict]) -> List[Dict]:
     """
-    Double-alliance strategy: ally with 2 strongest, both target the weakest.
-    If under attack: rally non-attackers against the attacker.
+    Intelligent Hybrid Diplomacy.
+    - Rally against runaway leaders.
+    - Divide & Conquer if we are leading.
+    - Double Alliance with strongest reliable partners.
     """
-    my_id = player["playerId"]
-    alive = _alive(enemies)
+    my_id = int(player["playerId"])
+    alive = [e for e in enemies if int(e.get("hp", 0)) > 0]
+    memory.record_intel(gid, turn, my_id, combat_actions)
+    
+    if len(alive) < 2: return []
 
-    # Record who attacked us from previous combat
-    attackers_on_us = set()
-    for ca in combat_actions:
-        act = ca.get("action", {})
-        if act.get("targetId") == my_id:
-            attackers_on_us.add(ca["playerId"])
-            memory._get(gid)["agg"][ca["playerId"]] += act.get("troopCount", 0)
-
-    if len(alive) < 2:
-        return []
-
+    def strength(e): return res_per_turn(int(e["level"])) + int(e["hp"])*0.5
+    sorted_enemies = sorted(alive, key=strength, reverse=True)
+    leader = sorted_enemies[0]
+    weakest = sorted_enemies[-1]
+    
+    # 1) BLUFFING/STALLING: If someone is way stronger than us, ally with them
+    # to keep them from hitting us while we catch up.
+    is_leader = strength(player) > strength(leader)
+    
     proposals = []
-    used = set()
-    sorted_alive = sorted(alive, key=_strength, reverse=True)
-    weakest = min(alive, key=lambda e: e["hp"] + e["armor"])
+    if not is_leader and strength(leader) > strength(player) * 1.5:
+        # We are underdogs - ally with the leader as a "shield"
+        proposals.append({"allyId": leader["playerId"], "attackTargetId": weakest["playerId"]})
+        print(f"[DIPLO] Bluffing alliance with leader {leader['playerId']}")
 
-    # RETALIATION MODE: if attacked, rally others against attacker
-    if attackers_on_us:
-        attacker_enemies = [e for e in alive if e["playerId"] in attackers_on_us]
-        main_attacker = max(attacker_enemies, key=_strength) if attacker_enemies else None
-        if main_attacker:
-            for c in sorted(
-                [e for e in alive if e["playerId"] not in attackers_on_us],
-                key=_strength, reverse=True
-            )[:2]:
-                if c["playerId"] not in used:
-                    proposals.append({
-                        "allyId": c["playerId"],
-                        "attackTargetId": main_attacker["playerId"]
-                    })
-                    used.add(c["playerId"])
+    # 2) RALLY: If not lead, rally non-leading players against the leader
+    if not is_leader and not proposals:
+        for e in sorted_enemies[1:3]: # 2nd and 3rd strongest
+            proposals.append({"allyId": e["playerId"], "attackTargetId": leader["playerId"]})
+            print(f"[DIPLO] Rallying {e['playerId']} against leader {leader['playerId']}")
 
-    # DEFAULT: double-alliance against weakest
+    # 3) DEFAULT: Double alliance against weakest
     if not proposals:
-        for c in sorted_alive:
-            if c["playerId"] != weakest["playerId"] and c["playerId"] not in used:
-                proposals.append({
-                    "allyId": c["playerId"],
-                    "attackTargetId": weakest["playerId"]
-                })
-                used.add(c["playerId"])
-                if len(proposals) >= 2:
-                    break
+        for e in sorted_enemies[:2]:
+            if e["playerId"] != weakest["playerId"]:
+                proposals.append({"allyId": e["playerId"], "attackTargetId": weakest["playerId"]})
 
-    memory.set_our_allies(gid, used)
-    return proposals
+    # Dedup and limit
+    dedup = {p["allyId"]: p for p in proposals}
+    result = list(dedup.values())[:2]
+    memory.set_our_allies(gid, [p["allyId"] for p in result])
+    return result
 
-
-# ─── Combat ──────────────────────────────────────────────────────────
 
 def combat(gid: int, turn: int, player: Dict, enemies: List[Dict],
            diplomacy: List[Dict], previous_attacks: List[Dict]) -> List[Dict]:
     """
-    Priority: Upgrade → Armor → Attack (focus fire on best target).
+    Adaptive Predator Combat Engine.
     """
-    my_id = player["playerId"]
-    resources = player["resources"]
-    hp = player["hp"]
-    current_armor = player["armor"]
-    level = player["level"]
-    alive = _alive(enemies)
+    my_id = int(player["playerId"])
+    res = int(player["resources"])
+    hp = int(player["hp"])
+    arm = int(player["armor"])
+    lvl = int(player["level"])
+    alive = [e for e in enemies if int(e.get("hp", 0)) > 0]
+    alive_ids = {int(e["playerId"]) for e in alive}
 
-    if not alive or resources <= 0:
-        return []
+    if not alive or res <= 0: return []
 
-    # ── INTEL ──
-    memory.record_attacks_on_us(gid, turn, my_id, previous_attacks)
-    memory.record_diplomacy_to_us(gid, turn, diplomacy, my_id)
+    memory.record_intel(gid, turn, my_id, previous_attacks)
+    memory.record_diplomacy(gid, turn, diplomacy, my_id)
 
-    incoming = 0
-    attacker_ids = set()
-    for pa in previous_attacks:
-        act = pa.get("action", {})
-        if act.get("targetId") == my_id:
-            incoming += act.get("troopCount", 0)
-            attacker_ids.add(pa["playerId"])
-
-    our_allies = set()
-    coordinated_targets = set()
-    for d in diplomacy:
-        act = d.get("action", {})
-        if act.get("allyId") == my_id:
-            our_allies.add(d["playerId"])
-            t = act.get("attackTargetId")
-            if t:
-                coordinated_targets.add(t)
+    # 1. Threat Prediction (Top 2 Active)
+    threats = []
+    for e in alive:
+        pid = int(e["playerId"])
+        income = res_per_turn(int(e["level"]))
+        est_res = income * 2.0 # Heuristic human stash
+        t = est_res * 0.6 * (1.0 + int(e["level"])*0.1)
+        if not memory.is_active(gid, pid, turn): t *= 0.2
+        if any(d.get("action", {}).get("attackTargetId") == my_id for d in diplomacy if d["playerId"] == pid):
+            t *= 1.8 # Declared hostile
+        threats.append(t)
+    
+    threats.sort(reverse=True)
+    predicted_dmg = sum(threats[:2]) * 1.1
 
     actions = []
-    avail = resources
+    avail = res
 
-    # ── 1. UPGRADE ──
-    if level < MAX_LEVEL:
-        cost = upg_cost(level)
-        gain = res_per_turn(level + 1) - res_per_turn(level)
-        remaining = max(1, FATIGUE_TURN - turn + 5)
-        payback = cost / gain if gain > 0 else 999
-
-        do_upgrade = (
-            avail >= cost + 5 and
-            payback < remaining * 0.7 and
-            not (hp < 35 and incoming > 15)
-        )
-        # Force upgrade early if affordable
-        if turn <= 4 and avail >= cost:
-            do_upgrade = True
-
-        if do_upgrade:
+    # 2. Economic Upgrade (Early Rush -> ROI Midgame)
+    if lvl < MAX_LEVEL:
+        cost = upg_cost(lvl)
+        can_afford = avail >= cost + 5
+        
+        # Priority 1: Early rush (Turns 1-6)
+        should_upg = (turn <= 5 and avail >= cost)
+        
+        # Priority 2: Mid-game ROI
+        if not should_upg and turn < 18:
+            gain = res_per_turn(lvl + 1) - res_per_turn(lvl)
+            payback = cost / gain
+            remaining = max(1, FATIGUE_TURN - turn + 5)
+            if payback < remaining * 0.7 and (hp + arm - predicted_dmg) > 25:
+                should_upg = True
+        
+        if should_upg and avail >= cost:
             actions.append({"type": "upgrade"})
             avail -= cost
+            print(f"[STRATEGY] Upgrading to L{lvl+1}. Turn {turn}")
 
-    if avail <= 0:
-        return _validate(actions, resources)
+    # 3. Defensive Armor
+    fatigue = fatigue_damage(turn)
+    total_threat = predicted_dmg + fatigue
+    hp_after = hp + arm - total_threat
 
-    # ── 2. ARMOR ──
-    armor_amt = 0
-    if incoming > 0:
-        # Predict ~70% of last incoming, subtract existing armor
-        desired = max(0, int(incoming * 0.7) - current_armor)
-        armor_amt = min(desired, int(avail * 0.4))
-    elif hp < 50:
-        armor_amt = min(15, int(avail * 0.25))
-    elif hp < 70 and len(alive) >= 2:
-        armor_amt = min(8, int(avail * 0.15))
+    if hp_after < 40 and avail > 0:
+        deficit = 50 - hp_after
+        armor_bid = min(avail, max(0, int(deficit)))
+        if armor_bid > 0:
+            actions.append({"type": "armor", "amount": armor_bid})
+            avail -= armor_bid
 
-    if turn >= FATIGUE_TURN:
-        armor_amt = min(armor_amt, int(avail * 0.1))
+    # 4. Attack (Focus Fire)
+    coordinated = set()
+    for d in diplomacy:
+        if d.get("action", {}).get("allyId") == my_id:
+            target = d["action"].get("attackTargetId")
+            if target: coordinated.add(int(target))
 
-    if armor_amt > 0:
-        actions.append({"type": "armor", "amount": armor_amt})
-        avail -= armor_amt
+    our_allies = memory.get_our_allies(gid)
 
-    if avail <= 0:
-        return _validate(actions, resources)
-
-    # ── 3. ATTACK ──
-    def score(e):
-        pid = e["playerId"]
+    def target_score(e):
+        pid = int(e["playerId"])
+        eff_hp = int(e["hp"]) + int(e["armor"])
         s = 0.0
-        eff_hp = e["hp"] + e["armor"]
-
-        # KILL BONUS
-        if eff_hp <= avail:
-            s += 500
-        # Coordinated target
-        if pid in coordinated_targets:
-            s += 80
-        # Retaliation
-        if pid in attacker_ids:
-            s += 60
-        s += memory.agg(gid, pid) * 0.3
-        # Betrayal
-        s += memory.betrayals(gid, pid) * 100
-        # Vulnerability
-        s += max(0, 100 - e["hp"])
-        # Danger
-        s += e["level"] * 15
-        # Armor waste
-        s -= e["armor"] * 0.8
-        # Alliance respect (early/mid game)
-        if pid in our_allies and memory.betrayals(gid, pid) == 0:
-            if turn < 15:
-                s -= 200
-            elif turn < 22:
-                s -= 50
+        if eff_hp <= avail: s += 5000 # KILL SHOT
+        if pid in coordinated: s += 500
+        if pid in our_allies: s -= 1000 # Respect alliance
+        if not memory.is_active(gid, pid, turn): s -= 800 # AFK Trap
+        s += int(e["level"]) * 50
+        s += memory._get(gid)["agg"][pid] * 0.5
         return s
 
-    targets = sorted(alive, key=score, reverse=True)
+    targets = sorted(alive, key=target_score, reverse=True)
     attacked = set()
-
     for t in targets:
-        if avail <= 0 or len(attacked) >= 2:
-            break
-        tid = t["playerId"]
-        if tid in attacked:
-            continue
-        # Don't attack respected allies unless they're the only target
-        if score(t) < 0 and len(alive) > 1:
-            continue
+        if avail <= 0 or len(attacked) >= 2: break
+        tid = int(t["playerId"])
+        priority = target_score(t)
+        
+        if priority < 0 and len(alive) > 1: continue # Don't hit friends/afk unless forced
 
-        eff_hp = t["hp"] + t["armor"]
-
-        # Can kill? Use exact amount
+        eff_hp = int(t["hp"]) + int(t["armor"])
         if eff_hp <= avail:
             troops = eff_hp
-        elif score(t) > 100:
-            troops = int(avail * 0.7) if len(attacked) == 0 else avail
-        elif len(targets) == 1 or len(attacked) == 1:
-            troops = avail
+        elif priority > 1000:
+            troops = int(avail * 0.8)
         else:
-            troops = int(avail * 0.6)
-
-        troops = max(1, min(troops, avail))
+            troops = avail if len(attacked) == 0 else avail
+            
+        troops = max(1, min(int(troops), avail))
         actions.append({"type": "attack", "targetId": tid, "troopCount": troops})
         avail -= troops
         attacked.add(tid)
 
-    return _validate(actions, resources)
+    return _validate(actions, res, lvl, alive_ids)
 
 
-def _validate(actions: List[Dict], total_resources: int) -> List[Dict]:
-    """Ensure no invalid actions that would cause entire response rejection."""
-    armor_count = 0
-    upgrade_count = 0
-    attack_targets = set()
-    total_cost = 0
+def _validate(actions: List[Dict], total_res: int, level: int, alive_ids: Set[int]) -> List[Dict]:
+    armor_done, upg_done, spent, targets = False, False, 0, set()
     clean = []
-
     for a in actions:
         t = a.get("type")
-        if t == "armor":
-            if armor_count >= 1 or a.get("amount", 0) <= 0:
-                continue
-            armor_count += 1
-            total_cost += a["amount"]
-        elif t == "upgrade":
-            if upgrade_count >= 1:
-                continue
-            upgrade_count += 1
-            # Cost already deducted in logic
+        if t == "armor" and not armor_done:
+            amt = int(a.get("amount", 0))
+            if amt > 0 and spent + amt <= total_res:
+                spent += amt; armor_done = True
+                clean.append({"type": "armor", "amount": amt})
+        elif t == "upgrade" and not upg_done:
+            cost = upg_cost(level)
+            if spent + cost <= total_res:
+                spent += cost; upg_done = True
+                clean.append({"type": "upgrade"})
         elif t == "attack":
-            tid = a.get("targetId")
-            tc = a.get("troopCount", 0)
-            if tid in attack_targets or tc <= 0:
-                continue
-            attack_targets.add(tid)
-            total_cost += tc
-        else:
-            continue
-        clean.append(a)
-
+            tid = int(a.get("targetId"))
+            troops = int(a.get("troopCount", 0))
+            if tid in alive_ids and tid not in targets and troops > 0 and spent + troops <= total_res:
+                spent += troops; targets.add(tid)
+                clean.append({"type": "attack", "targetId": tid, "troopCount": troops})
     return clean
