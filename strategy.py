@@ -241,7 +241,9 @@ def combat(gid: int, turn: int, player: Dict, enemies: List[Dict],
         tid = int(t["playerId"])
         priority = target_score(t)
         
-        if priority < 0 and len(alive) > 1: continue # Don't hit friends/afk unless forced
+        # REMOVED: restrictive skip.
+        # Now we only skip if it's a very strong ally AND we have other targets.
+        if priority < -1500 and len(alive) > 1: continue
 
         eff_hp = int(t["hp"]) + int(t["armor"])
         if eff_hp <= avail:
@@ -252,6 +254,7 @@ def combat(gid: int, turn: int, player: Dict, enemies: List[Dict],
             troops = avail if len(attacked) == 0 else avail
             
         troops = max(1, min(int(troops), avail))
+        print(f"[STRATEGY] Attacking {tid} with {troops} troops (Score: {priority})")
         actions.append({"type": "attack", "targetId": tid, "troopCount": troops})
         avail -= troops
         attacked.add(tid)
@@ -281,3 +284,4 @@ def _validate(actions: List[Dict], total_res: int, level: int, alive_ids: Set[in
                 spent += troops; targets.add(tid)
                 clean.append({"type": "attack", "targetId": tid, "troopCount": troops})
     return clean
+а 
